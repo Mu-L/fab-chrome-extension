@@ -17,6 +17,7 @@ body {
 .account-label { font-size: 13px; color: #88889a; }
 .btn-icon { background: none; border: 1px solid #2e2e3a; color: #88889a; font-size: 18px; padding: 4px 10px; border-radius: 6px; cursor: pointer; }
 .btn-icon:hover { background: #252530; color: #d4d4d8; }
+.btn-icon:disabled { cursor: wait; opacity: 0.55; }
 
 /* Toolbar */
 .toolbar {
@@ -96,6 +97,7 @@ body {
   border: 1px solid #2e2e3a; background: #141418; color: #d4d4d8; font-size: 13px;
 }
 .version-select:focus { outline: none; border-color: #0078F0; }
+.version-select:disabled { opacity: 0.65; cursor: not-allowed; }
 
 .card-actions { display: flex; gap: 8px; align-items: center; }
 .btn {
@@ -112,6 +114,8 @@ body {
 .btn-ghost:hover { background: #252530; }
 .download-progress { font-size: 12px; color: #0078F0; display: flex; align-items: center; gap: 6px; }
 .download-done { font-size: 12px; color: #3cb88a; }
+.download-error { font-size: 12px; color: #f87171; }
+.download-cancelled { font-size: 12px; color: #94a3b8; }
 
 /* Loading & Empty */
 .loading-container, .empty-container {
@@ -141,6 +145,7 @@ body {
 }
 .toast-success { background: #0e2822; color: #5ad8a0; }
 .toast-error { background: #381818; color: #e08888; }
+.toast-warning { background: #382d18; color: #e7bd67; }
 @keyframes slideUp { from { transform: translateY(20px); opacity: 0; } to { transform: translateY(0); opacity: 1; } }
 
 /* Refresh button spin */

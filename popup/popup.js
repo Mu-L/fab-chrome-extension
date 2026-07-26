@@ -30,14 +30,13 @@ async function checkAuth() {
     const resp = await chrome.runtime.sendMessage({ action: "auth:status" });
     if (resp?.status === "logged_in") {
       $("#account-name").textContent = resp.displayName || "Unknown";
-      $("#account-id").textContent = resp.accountId ? resp.accountId.slice(0, 8) + "..." : "";
       $("#account-avatar").textContent = (resp.displayName || "U")[0].toUpperCase();
       loadCacheStatus();
       showState("logged-in");
-    } else if (resp?.status === "expired") {
+    } else if (resp?.status === "logged_out") {
       showState("logged-out");
     } else {
-      showState("logged-out");
+      throw new Error(resp?.message || "Could not check your Epic login.");
     }
   } catch (e) {
     showState("error");
@@ -47,10 +46,12 @@ async function checkAuth() {
 
 async function loadCacheStatus() {
   try {
-    const resp = await chrome.runtime.sendMessage({ action: "library:list" });
+    const resp = await chrome.runtime.sendMessage({ action: "library:status" });
     if (resp?.status === "ok") {
-      const label = resp.cached ? (resp.stale ? " (stale, refresh failed)" : " (cached)") : " (fresh)";
-      $("#cache-status").textContent = `Library: ${resp.totalCount || resp.items?.length || 0} items${label}`;
+      const label = resp.stale ? " (stale)" : " (cached)";
+      $("#cache-status").textContent = `Library: ${resp.totalCount || 0} items${label}`;
+    } else {
+      $("#cache-status").textContent = "";
     }
   } catch (e) { dbg('Failed to load cache status:', e.message); $("#cache-status").textContent = ""; }
 }
@@ -59,24 +60,11 @@ async function loadCacheStatus() {
 
 $("#btn-login").addEventListener("click", async () => {
   try {
-    await chrome.runtime.sendMessage({ action: "auth:start" });
-    showState("pending");
-  } catch (e) {
-    showToast(e.message, "error");
-  }
-});
-
-$("#btn-manual").addEventListener("click", async () => {
-  const code = $("#manual-code").value.trim();
-  if (!code) { showToast("Paste the authorization code first.", "error"); return; }
-  try {
-    const resp = await chrome.runtime.sendMessage({ action: "auth:manual-code", code });
-    if (resp?.status === "ok") {
-      showToast(`Logged in as ${resp.displayName}`);
-      setTimeout(checkAuth, 500);
-    } else {
-      showToast(resp?.message || "Auth failed", "error");
+    const response = await chrome.runtime.sendMessage({ action: "auth:start" });
+    if (response?.status !== "pending") {
+      throw new Error(response?.message || "Could not start Epic login.");
     }
+    showState("pending");
   } catch (e) {
     showToast(e.message, "error");
   }
@@ -87,18 +75,18 @@ $("#btn-open-library").addEventListener("click", () => {
 });
 
 $("#btn-logout").addEventListener("click", async () => {
-  await chrome.runtime.sendMessage({ action: "auth:logout" });
-  showState("logged-out");
+  try {
+    const response = await chrome.runtime.sendMessage({ action: "auth:logout" });
+    if (response?.status !== "logged_out") {
+      throw new Error(response?.message || "Could not log out.");
+    }
+    showState("logged-out");
+  } catch (e) {
+    showToast(e.message, "error");
+  }
 });
 
 $("#btn-retry").addEventListener("click", checkAuth);
-
-// ====== Listen for auth completion ======
-chrome.runtime.onMessage.addListener((message) => {
-  if (message.action === "auth:complete") {
-    checkAuth();
-  }
-});
 
 // Initial check
 checkAuth();

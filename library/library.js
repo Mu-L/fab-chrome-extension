@@ -1,513 +1,695 @@
-// Fab Library Browser — search, filter, version selection, download trigger
-import { downloadAsset } from '../vendor/fab-download-browser.js';
-import { debug } from '../lib/debug.js';
+// Fab Library Browser — account library, version selection, and bounded downloads.
+import { downloadAsset } from "../vendor/fab-download-browser.js";
+import { debug } from "../lib/debug.js";
 
-const $ = (sel, parent = document) => parent.querySelector(sel);
-const $$ = (sel, parent = document) => [...parent.querySelectorAll(sel)];
+const $ = (selector, parent = document) => parent.querySelector(selector);
+const $$ = (selector, parent = document) => [...parent.querySelectorAll(selector)];
 
-// ==================== State ====================
+const TYPE_BADGES = {
+  "3D":               { cls: "badge-blue", label: "3D" },
+  "工具与插件":        { cls: "badge-purple", label: "Plugin" },
+  COMPLETE_PROJECT:   { cls: "badge-green", label: "Project" },
+  ASSET_PACK:         { cls: "badge-blue", label: "Assets" },
+  CODE_PLUGIN:        { cls: "badge-purple", label: "Code Plugin" },
+  "游戏系统":          { cls: "badge-indigo", label: "Game System" },
+  "材质与纹理":        { cls: "badge-orange", label: "Material" },
+  "视觉效果":          { cls: "badge-pink", label: "VFX" },
+  "动画":             { cls: "badge-teal", label: "Anim" },
+  "游戏模板":          { cls: "badge-green", label: "Template" },
+  "教程和示例":        { cls: "badge-gray", label: "Tutorial" },
+  Legacy:             { cls: "badge-gray", label: "Legacy" },
+  ENGINE:             { cls: "badge-gray", label: "Engine" },
+};
+const MAX_RENDERED_CARDS = 1_000;
+const MAX_ACTIVE_DOWNLOADS = 2;
+
 let allItems = [];
 let engineVersions = new Set();
+let loadGeneration = 0;
+let authStateRevision = 0;
+let toastTimer = null;
 
-/** Active downloads: key = `${assetId}::${artifactId}` */
+/** One active job per asset card. */
 const activeDownloads = new Map();
+const pickingAssets = new Set();
 
-function downloadKey(assetId, artifactId) {
-  return `${assetId}::${artifactId}`;
+function createElement(tag, { className = "", text = "", title = "" } = {}) {
+  const node = document.createElement(tag);
+  if (className) node.className = className;
+  if (text !== "") node.textContent = String(text);
+  if (title) node.title = title;
+  return node;
 }
 
-// ==================== Type badge mapping ====================
-const TYPE_BADGES = {
-  "3D":                { cls: "badge-blue",   label: "3D" },
-  "工具与插件":         { cls: "badge-purple", label: "Plugin" },
-  "COMPLETE_PROJECT":  { cls: "badge-green",  label: "Project" },
-  "ASSET_PACK":        { cls: "badge-blue",   label: "Assets" },
-  "CODE_PLUGIN":       { cls: "badge-purple", label: "Code Plugin" },
-  "游戏系统":           { cls: "badge-indigo", label: "Game System" },
-  "材质与纹理":         { cls: "badge-orange", label: "Material" },
-  "视觉效果":           { cls: "badge-pink",   label: "VFX" },
-  "动画":              { cls: "badge-teal",   label: "Anim" },
-  "游戏模板":           { cls: "badge-green",  label: "Template" },
-  "教程和示例":         { cls: "badge-gray",   label: "Tutorial" },
-  "Legacy":            { cls: "badge-gray",   label: "Legacy" },
-  "ENGINE":            { cls: "badge-gray",   label: "Engine" },
-};
+function showToast(message, type = "success") {
+  const toast = $("#toast");
+  clearTimeout(toastTimer);
+  toast.textContent = String(message || "");
+  toast.className = `toast toast-${type}`;
+  toast.style.display = "block";
+  toastTimer = setTimeout(() => { toast.style.display = "none"; }, 4000);
+}
 
-function getBadge(item) {
-  const listingBadge = TYPE_BADGES[item.listingType] || { cls: "badge-gray", label: item.listingType };
-  const methodBadge = TYPE_BADGES[item.distributionMethod];
-  if (methodBadge && item.distributionMethod !== item.listingType) {
-    return [listingBadge, methodBadge];
+function missingBrowserFeatures() {
+  const missing = [];
+  if (typeof window.showDirectoryPicker !== "function") missing.push("directory picker");
+  if (!globalThis.crypto?.subtle) missing.push("Web Crypto");
+  if (!chrome.storage?.session || typeof chrome.storage.local?.setAccessLevel !== "function") {
+    missing.push("Chrome extension storage");
   }
-  return [listingBadge];
+  try {
+    if (typeof DecompressionStream !== "function") throw new Error("missing");
+    new DecompressionStream("deflate-raw");
+  } catch {
+    missing.push("deflate-raw decompression");
+  }
+  return missing;
 }
 
-// ==================== Toast ====================
-function showToast(msg, type = "success") {
-  const t = $("#toast");
-  t.textContent = msg; t.className = `toast toast-${type}`; t.style.display = "block";
-  setTimeout(() => { t.style.display = "none"; }, 4000);
-}
-
-// ==================== Load Library ====================
-async function loadLibrary(forceRefresh = false) {
-  $("#loading-state").style.display = "flex";
-  $("#empty-state").style.display = "none";
+function showEmptyMessage(message) {
+  $("#loading-state").style.display = "none";
   $("#card-grid").style.display = "none";
+  const empty = $("#empty-state");
+  $("p", empty).textContent = message;
+  empty.style.display = "flex";
+}
 
-  const action = forceRefresh ? "library:refresh" : "library:list";
-  const resp = await chrome.runtime.sendMessage({ action });
-
-  if (resp?.status === "auth_expired") {
-    $("#loading-state").style.display = "none";
-    $("#empty-state").style.display = "flex";
-    $("p", $("#empty-state")).textContent = "Please log in first. Open the Fab Downloader popup to authenticate.";
-    $("#btn-login-prompt").style.display = "none";
-    return;
+function abortActiveDownloads() {
+  const jobs = [...activeDownloads.values()];
+  activeDownloads.clear();
+  for (const state of jobs) {
+    state.controller.abort();
+    void chrome.runtime.sendMessage({
+      action: "manifest:cancel",
+      jobId: state.jobId,
+    }).catch(() => {});
   }
+}
 
-  if (resp?.status !== "ok") {
-    $("#loading-state").style.display = "none";
-    showToast(resp?.message || "Failed to load library", "error");
-    return;
+function clearLibraryForAuthChange(
+  message = "Authentication changed. Log in from the popup, then refresh this page.",
+) {
+  authStateRevision++;
+  loadGeneration++;
+  abortActiveDownloads();
+  pickingAssets.clear();
+  allItems = [];
+  engineVersions = new Set();
+  clearTimeout(searchTimer);
+  clearTimeout(toastTimer);
+
+  $("#search-input").value = "";
+  $("#filter-type").value = "";
+  $("#display-name").textContent = "";
+  $("#result-count").textContent = "";
+  $("#card-grid").replaceChildren();
+  $("#toast").textContent = "";
+  $("#toast").style.display = "none";
+  rebuildEngineVersions();
+
+  const refreshButton = $("#btn-refresh");
+  refreshButton.disabled = false;
+  refreshButton.removeAttribute("aria-busy");
+  showEmptyMessage(message);
+}
+
+async function loadLibrary(forceRefresh = false) {
+  const generation = ++loadGeneration;
+  const refreshButton = $("#btn-refresh");
+  refreshButton.disabled = true;
+  refreshButton.setAttribute("aria-busy", "true");
+
+  if (allItems.length === 0) {
+    $("#loading-state").style.display = "flex";
+    $("#card-grid").style.display = "none";
   }
+  $("#empty-state").style.display = "none";
 
-  allItems = resp.items || [];
+  try {
+    const action = forceRefresh ? "library:refresh" : "library:list";
+    const response = await chrome.runtime.sendMessage({ action });
+    if (generation !== loadGeneration) return { status: "superseded" };
+
+    if (response?.status === "auth_expired") {
+      clearLibraryForAuthChange("Please log in from the Fab Downloader popup first.");
+      return { status: "auth_expired" };
+    }
+    if (response?.status !== "ok") {
+      throw new Error(response?.message || "Failed to load library");
+    }
+
+    allItems = Array.isArray(response.items) ? response.items : [];
+    rebuildEngineVersions();
+    $("#display-name").textContent = response.displayName || "";
+    $("#loading-state").style.display = "none";
+    renderCards();
+
+    if (response.source === "stale") {
+      showToast(response.warning || "Refresh failed; showing the last complete cache.", "warning");
+    } else if (forceRefresh) {
+      showToast(response.cacheSaved === false
+        ? "Library refreshed, but the local cache could not be saved."
+        : "Library refreshed");
+    }
+    return { status: "ok", source: response.source };
+  } catch (error) {
+    if (generation !== loadGeneration) return { status: "superseded" };
+    debug.warn("Library load failed:", error?.message);
+    $("#loading-state").style.display = "none";
+    if (allItems.length > 0) {
+      $("#card-grid").style.display = "grid";
+      showToast(error?.message || "Failed to refresh library", "error");
+    } else {
+      showEmptyMessage(error?.message || "Failed to load library. Try again.");
+    }
+    return { status: "error" };
+  } finally {
+    if (generation === loadGeneration) {
+      refreshButton.disabled = false;
+      refreshButton.removeAttribute("aria-busy");
+    }
+  }
+}
+
+function rebuildEngineVersions() {
   engineVersions = new Set();
   for (const item of allItems) {
-    for (const pv of item.projectVersions || []) {
-      for (const ev of pv.engineVersions || []) {
-        engineVersions.add(ev);
+    for (const projectVersion of item.projectVersions || []) {
+      for (const engineVersion of projectVersion.engineVersions || []) {
+        if (typeof engineVersion === "string") engineVersions.add(engineVersion);
       }
     }
   }
 
-  // Populate engine filter dropdown
-  const engineSelect = $("#filter-engine");
-  engineSelect.innerHTML = '<option value="">All Engine Versions</option>';
-  [...engineVersions].sort((a, b) => {
-    const pa = parseEngineNum(a), pb = parseEngineNum(b);
-    return pb - pa || a.localeCompare(b);
-  }).forEach(ev => {
-    const opt = document.createElement("option");
-    opt.value = ev; opt.textContent = ev;
-    engineSelect.appendChild(opt);
-  });
-
-  // Update user info (displayName comes from the library:list response)
-  $("#display-name").textContent = resp.displayName || "";
-
-  $("#loading-state").style.display = "none";
-  renderCards();
+  const select = $("#filter-engine");
+  select.replaceChildren(createElement("option", { text: "All Engine Versions" }));
+  select.firstElementChild.value = "";
+  [...engineVersions]
+    .sort((a, b) => parseEngineNumber(b) - parseEngineNumber(a) || a.localeCompare(b))
+    .forEach((engineVersion) => {
+      const option = createElement("option", { text: engineVersion });
+      option.value = engineVersion;
+      select.append(option);
+    });
 }
 
-function parseEngineNum(s) {
-  const m = s?.match(/UE_(\d+)\.(\d+)/);
-  return m ? parseInt(m[1]) * 100 + parseInt(m[2]) : 0;
+function parseEngineNumber(value) {
+  const match = value?.match(/UE_(\d+)\.(\d+)/);
+  return match ? Number(match[1]) * 100 + Number(match[2]) : 0;
 }
 
-// ==================== Render ====================
 function renderCards() {
   const grid = $("#card-grid");
-  grid.innerHTML = "";
+  grid.replaceChildren();
 
-  const searchTerm = $("#search-input").value.toLowerCase();
+  const searchTerm = $("#search-input").value.trim().toLocaleLowerCase();
   const filterType = $("#filter-type").value;
   const filterEngine = $("#filter-engine").value;
 
-  let filtered = allItems;
+  const filtered = allItems.filter((item) => {
+    const matchesSearch = !searchTerm
+      || String(item.title || "").toLocaleLowerCase().includes(searchTerm)
+      || String(item.seller || "").toLocaleLowerCase().includes(searchTerm);
+    const matchesType = !filterType
+      || item.listingType === filterType
+      || item.distributionMethod === filterType;
+    const matchesEngine = !filterEngine
+      || (item.projectVersions || []).some((version) =>
+        (version.engineVersions || []).includes(filterEngine));
+    return matchesSearch && matchesType && matchesEngine;
+  });
 
-  if (searchTerm) {
-    filtered = filtered.filter(i =>
-      (i.title || "").toLowerCase().includes(searchTerm) ||
-      (i.seller || "").toLowerCase().includes(searchTerm)
-    );
-  }
-
-  if (filterType) {
-    if (filterType === "COMPLETE_PROJECT") {
-      filtered = filtered.filter(i => i.distributionMethod === "COMPLETE_PROJECT");
-    } else {
-      filtered = filtered.filter(i =>
-        i.listingType === filterType || i.distributionMethod === filterType
-      );
-    }
-  }
-
-  if (filterEngine) {
-    filtered = filtered.filter(i =>
-      (i.projectVersions || []).some(pv =>
-        (pv.engineVersions || []).includes(filterEngine)
-      )
-    );
-  }
-
-  $("#result-count").textContent = `${filtered.length} of ${allItems.length} items`;
-
+  const activeItems = filtered.filter((item) => activeDownloads.has(item.assetId));
+  const visibleItems = [
+    ...activeItems,
+    ...filtered.filter((item) => !activeDownloads.has(item.assetId)),
+  ].slice(0, MAX_RENDERED_CARDS);
+  $("#result-count").textContent = filtered.length > visibleItems.length
+    ? `${visibleItems.length} of ${filtered.length} matches shown · narrow search`
+    : `${filtered.length} of ${allItems.length} items`;
   if (filtered.length === 0) {
-    grid.innerHTML = '<div class="empty-container" style="grid-column:1/-1"><p>No matching items.</p></div>';
-    grid.style.display = "grid";
-    return;
+    const empty = createElement("div", { className: "empty-container", text: "No matching items." });
+    empty.style.gridColumn = "1 / -1";
+    grid.append(empty);
+  } else {
+    for (const item of visibleItems) grid.append(createCard(item));
   }
-
-  for (const item of filtered) {
-    grid.appendChild(createCard(item));
-  }
+  $("#empty-state").style.display = "none";
   grid.style.display = "grid";
 }
 
+function safeImageUrl(value) {
+  try {
+    const url = new URL(String(value || ""));
+    if (url.protocol !== "https:" || url.username || url.password) return "";
+    return url.href;
+  } catch {
+    return "";
+  }
+}
+
+function badgesFor(item) {
+  const fallback = { cls: "badge-gray", label: String(item.listingType || "Unknown") };
+  const listing = TYPE_BADGES[item.listingType] || fallback;
+  const distribution = TYPE_BADGES[item.distributionMethod];
+  return distribution && item.distributionMethod !== item.listingType
+    ? [listing, distribution]
+    : [listing];
+}
+
 function createCard(item) {
-  const card = document.createElement("div");
-  card.className = "card";
+  const card = createElement("article", { className: "card" });
+  card.dataset.assetId = item.assetId;
 
-  // Thumbnail
-  const thumbUrl = (item.images && item.images[0]?.url) || "";
-  let thumbHtml;
-  if (thumbUrl) {
-    thumbHtml = `<img class="card-thumb" src="${escapeAttr(thumbUrl)}" alt="" loading="lazy">`;
+  const header = createElement("div", { className: "card-header" });
+  const imageUrl = safeImageUrl(item.images?.[0]?.url);
+  if (imageUrl) {
+    const image = createElement("img", { className: "card-thumb" });
+    image.crossOrigin = "anonymous";
+    image.src = imageUrl;
+    image.alt = "";
+    image.loading = "lazy";
+    image.referrerPolicy = "no-referrer";
+    image.addEventListener("error", () => image.replaceWith(thumbnailPlaceholder(item.title)));
+    header.append(image);
   } else {
-    const initial = (item.title || "?")[0].toUpperCase();
-    thumbHtml = `<div class="card-thumb-placeholder">${initial}</div>`;
+    header.append(thumbnailPlaceholder(item.title));
   }
 
-  // Badges
-  const badges = getBadge(item);
-  const badgesHtml = badges.map(b => `<span class="badge ${b.cls}">${escapeHtml(b.label)}</span>`).join("");
-
-  // Engine versions
-  const allEngines = new Set();
-  for (const pv of item.projectVersions || []) {
-    for (const ev of pv.engineVersions || []) allEngines.add(ev);
+  const info = createElement("div", { className: "card-info" });
+  info.append(createElement("div", {
+    className: "card-title",
+    text: item.title || "Untitled asset",
+    title: item.title || "",
+  }));
+  const badges = createElement("div", { className: "card-badges" });
+  for (const badge of badgesFor(item)) {
+    badges.append(createElement("span", { className: `badge ${badge.cls}`, text: badge.label }));
   }
-  const sortedEngines = [...allEngines].sort((a, b) => parseEngineNum(b) - parseEngineNum(a));
-  const enginesText = sortedEngines.slice(0, 8).join(", ");
-  const enginesMore = sortedEngines.length > 8 ? ` +${sortedEngines.length - 8} more` : "";
+  info.append(badges);
 
-  // Version options for expanded detail
-  const versionOptions = (item.projectVersions || []).map(pv => {
-    const evList = (pv.engineVersions || []).join(", ") || "Engine (no specific versions)";
-    const platforms = (pv.targetPlatforms || []).join(", ") || "All";
-    return `<option value="${escapeAttr(pv.artifactId)}" data-asset-id="${escapeAttr(item.assetId)}" data-namespace="${escapeAttr(item.assetNamespace)}">
-      ${escapeHtml(pv.artifactId)} — ${escapeHtml(evList)} [${escapeHtml(platforms)}]
-    </option>`;
-  }).join("");
+  const engines = new Set();
+  for (const version of item.projectVersions || []) {
+    for (const engine of version.engineVersions || []) engines.add(engine);
+  }
+  const sortedEngines = [...engines].sort((a, b) => parseEngineNumber(b) - parseEngineNumber(a));
+  const engineText = sortedEngines.slice(0, 8).join(", ");
+  info.append(createElement("div", {
+    className: "card-engines",
+    text: `${engineText}${sortedEngines.length > 8 ? ` +${sortedEngines.length - 8} more` : ""}`,
+  }));
+  if (item.seller) info.append(createElement("div", { className: "card-seller", text: `by ${item.seller}` }));
+  header.append(info);
+  card.append(header);
 
-  const sellerHtml = item.seller ? `<div class="card-seller">by ${escapeHtml(item.seller)}</div>` : "";
+  const detail = createElement("div", { className: "card-detail" });
+  detail.append(createElement("label", {
+    className: "version-select-label",
+    text: "Select version to download:",
+  }));
+  const versionSelect = createElement("select", { className: "version-select" });
+  versionSelect.append(createElement("option", { text: "Choose a version..." }));
+  versionSelect.firstElementChild.value = "";
+  for (const version of item.projectVersions || []) {
+    const enginesLabel = (version.engineVersions || []).join(", ") || "Engine (unspecified)";
+    const platforms = (version.targetPlatforms || []).join(", ") || "All";
+    const option = createElement("option", {
+      text: `${version.artifactId} — ${enginesLabel} [${platforms}]`,
+    });
+    option.value = version.artifactId;
+    option.dataset.assetId = item.assetId;
+    option.dataset.namespace = item.assetNamespace;
+    versionSelect.append(option);
+  }
+  detail.append(versionSelect);
 
-  card.innerHTML = `
-    <div class="card-header">
-      ${thumbHtml}
-      <div class="card-info">
-        <div class="card-title" title="${escapeAttr(item.title)}">${escapeHtml(item.title)}</div>
-        <div class="card-badges">${badgesHtml}</div>
-        <div class="card-engines">${escapeHtml(enginesText)}${enginesMore}</div>
-        ${sellerHtml}
-      </div>
-    </div>
-    <div class="card-detail">
-      <label class="version-select-label">Select version to download:</label>
-      <select class="version-select">
-        <option value="">Choose a version...</option>
-        ${versionOptions}
-      </select>
-      <div class="card-actions">
-        <button class="btn btn-primary btn-download" disabled>Download</button>
-        <button class="btn btn-danger btn-cancel" style="display:none">Cancel</button>
-        <span class="download-status"></span>
-      </div>
-    </div>
-  `;
+  const actions = createElement("div", { className: "card-actions" });
+  const downloadButton = createElement("button", {
+    className: "btn btn-primary btn-download",
+    text: "Download",
+  });
+  downloadButton.disabled = true;
+  const cancelButton = createElement("button", {
+    className: "btn btn-danger btn-cancel",
+    text: "Cancel",
+  });
+  cancelButton.style.display = "none";
+  const status = createElement("span", { className: "download-status" });
+  actions.append(downloadButton, cancelButton, status);
+  detail.append(actions);
+  card.append(detail);
 
-  // Click card (anywhere) to expand/collapse — but not on interactive elements
-  card.addEventListener("click", (e) => {
-    // Don't toggle when clicking interactive controls
-    if (e.target.closest('select, button, input, a')) return;
-    // Don't collapse cards with active downloads
-    if (card.classList.contains("expanded") && card.dataset.downloadActive === "1") return;
+  header.addEventListener("click", () => {
+    if (activeDownloads.has(item.assetId) && card.classList.contains("expanded")) return;
     const wasExpanded = card.classList.contains("expanded");
-    // Collapse other cards (but not those with active downloads)
-    $$(".card.expanded").forEach(c => {
-      if (c.dataset.downloadActive !== "1") c.classList.remove("expanded");
+    $$(".card.expanded").forEach((other) => {
+      if (!activeDownloads.has(other.dataset.assetId)) other.classList.remove("expanded");
     });
     if (!wasExpanded) card.classList.add("expanded");
   });
 
-  // Version select → enable download
-  const select = $(".version-select", card);
-  const btnDownload = $(".btn-download", card);
-  const btnCancel = $(".btn-cancel", card);
-  const status = $(".download-status", card);
+  versionSelect.addEventListener("change", () => {
+    downloadButton.disabled =
+      !versionSelect.value ||
+      activeDownloads.has(item.assetId) ||
+      pickingAssets.has(item.assetId);
+    status.replaceChildren();
+  });
 
-  select.addEventListener("change", () => {
-    const key = downloadKey(item.assetId, select.value);
-    const active = activeDownloads.get(key);
-    if (active) {
-      // Re-select the currently downloading version → show cancel UI
-      restoreDownloadUI(card, active);
-    } else {
-      btnDownload.disabled = !select.value;
-      btnDownload.textContent = "Download";
-      btnCancel.style.display = "none";
-      status.innerHTML = "";
+  downloadButton.addEventListener("click", async (event) => {
+    event.stopPropagation();
+    if (activeDownloads.size + pickingAssets.size >= MAX_ACTIVE_DOWNLOADS) {
+      showToast(`At most ${MAX_ACTIVE_DOWNLOADS} downloads can be active at once.`, "error");
+      return;
+    }
+    if (
+      !versionSelect.value ||
+      activeDownloads.has(item.assetId) ||
+      pickingAssets.has(item.assetId)
+    ) {
+      return;
+    }
+
+    const option = versionSelect.selectedOptions[0];
+    const pickerAuthRevision = authStateRevision;
+    const selection = {
+      assetId: option.dataset.assetId,
+      assetNamespace: option.dataset.namespace,
+      artifactId: option.value,
+    };
+    pickingAssets.add(item.assetId);
+    downloadButton.disabled = true;
+
+    // This picker must remain the first asynchronous operation triggered by the click.
+    try {
+      const dirHandle = await window.showDirectoryPicker({ mode: "readwrite" });
+      if (pickerAuthRevision !== authStateRevision) {
+        throw new DOMException("Authentication changed.", "AbortError");
+      }
+      if (activeDownloads.size >= MAX_ACTIVE_DOWNLOADS) {
+        throw new Error(`At most ${MAX_ACTIVE_DOWNLOADS} downloads can be active at once.`);
+      }
+      void startDownload({
+        card,
+        item,
+        ...selection,
+        dirHandle,
+        versionSelect,
+        downloadButton,
+        cancelButton,
+        status,
+      }).catch((error) => {
+        showToast(error?.message || "Could not start the download.", "error");
+      });
+    } catch (error) {
+      if (error?.name !== "AbortError") showToast(error?.message || "Could not open the folder picker.", "error");
+    } finally {
+      pickingAssets.delete(item.assetId);
+      if (!activeDownloads.has(item.assetId)) {
+        downloadButton.disabled = !versionSelect.value;
+      }
     }
   });
 
-  select.addEventListener("dblclick", (e) => {
-    e.stopPropagation();
+  cancelButton.addEventListener("click", (event) => {
+    event.stopPropagation();
+    const state = activeDownloads.get(item.assetId);
+    if (!state) return;
+    state.controller.abort();
+    chrome.runtime.sendMessage({ action: "manifest:cancel", jobId: state.jobId }).catch(() => {});
+    cancelButton.textContent = "Cancelling...";
+    cancelButton.disabled = true;
   });
 
-  // Check if any version of this item has an active download — restore UI
-  for (const pv of (item.projectVersions || [])) {
-    const key = downloadKey(item.assetId, pv.artifactId);
-    const active = activeDownloads.get(key);
-    if (active) {
-      // Pre-select the downloading version
-      select.value = pv.artifactId;
-      card.classList.add("expanded");
-      card.dataset.downloadActive = "1";
-      restoreDownloadUI(card, active);
-      break;
-    }
-  }
-
-  // Download button
-  btnDownload.addEventListener("click", async (e) => {
-    e.stopPropagation();
-    if (!select.value) return;
-
-    const option = select.selectedOptions[0];
-    const assetId = option.dataset.assetId;
-    const assetNamespace = option.dataset.namespace;
-    const artifactId = option.value;
-
-    await startDownload(card, item, assetId, assetNamespace, artifactId, status, btnDownload, btnCancel);
-  });
-
-  // Cancel button
-  btnCancel.addEventListener("click", (e) => {
-    e.stopPropagation();
-    const key = downloadKey(item.assetId, select.value);
-    const active = activeDownloads.get(key);
-    if (active) {
-      active.controller.abort();
-      btnCancel.textContent = "Cancelling...";
-      btnCancel.disabled = true;
-    }
-  });
-
+  const active = activeDownloads.get(item.assetId);
+  if (active) restoreDownloadUi(card, versionSelect, downloadButton, cancelButton, status, active);
   return card;
 }
 
-// ==================== Download management ====================
+function thumbnailPlaceholder(title) {
+  return createElement("div", {
+    className: "card-thumb-placeholder",
+    text: String(title || "?").charAt(0).toLocaleUpperCase() || "?",
+  });
+}
 
-async function startDownload(card, item, assetId, assetNamespace, artifactId, statusEl, btnDownload, btnCancel) {
-  const key = downloadKey(assetId, artifactId);
+async function startDownload(context) {
+  const {
+    card, item, assetId, assetNamespace, artifactId, dirHandle,
+    versionSelect, downloadButton, cancelButton, status,
+  } = context;
+  const jobId = crypto.randomUUID();
   const controller = new AbortController();
-
-  btnDownload.disabled = true;
-  btnDownload.style.display = "none";
-  btnCancel.style.display = "";
-  btnCancel.textContent = "Cancel";
-  btnCancel.disabled = false;
-  card.dataset.downloadActive = "1";
-  card.classList.add("expanded");
-  statusEl.innerHTML = '<span class="download-progress">Getting manifest...</span>';
-
-  const state = { controller, item, progress: { phase: 'manifest', current: 0, total: 0, totalWritten: 0, label: 'Getting manifest...', detail: '' } };
-  activeDownloads.set(key, state);
+  const state = {
+    jobId,
+    assetId,
+    artifactId,
+    controller,
+    progress: { phase: "preparing", jobId, label: "Getting manifest..." },
+    view: null,
+  };
+  activeDownloads.set(assetId, state);
+  if (card.isConnected) {
+    restoreDownloadUi(card, versionSelect, downloadButton, cancelButton, status, state);
+  } else {
+    renderCards();
+  }
 
   try {
-    const resp = await chrome.runtime.sendMessage({
-      action: "manifest:fetch",
-      assetId, assetNamespace, artifactId,
+    const descriptor = await chrome.runtime.sendMessage({
+      action: "manifest:prepare",
+      jobId,
+      assetId,
+      assetNamespace,
+      artifactId,
     });
-
-    if (resp?.status !== "ok") {
-      throw new Error(resp?.message || "Failed to get manifest");
+    if (controller.signal.aborted) throw new DOMException("Aborted", "AbortError");
+    if (descriptor?.status === "auth_expired") {
+      clearLibraryForAuthChange("Please log in from the Fab Downloader popup first.");
+      return;
+    }
+    if (descriptor?.status !== "ok") {
+      throw new Error(descriptor?.message || "Failed to prepare download");
     }
 
-    await handleBrowserDownload(item, resp, controller.signal, (p) => {
-      state.progress = p;
-      if (statusEl.isConnected) updateProgressUI(statusEl, p);
-    });
-  } catch (e) {
-    if (e.name === 'AbortError' || controller.signal.aborted) {
-      if (statusEl.isConnected) {
-        statusEl.innerHTML = '<span style="color:#94a3b8;font-size:12px">Cancelled.</span>';
-      }
-    } else {
-      debug.warn('Download failed:', e.message);
-      if (statusEl.isConnected) {
-        statusEl.innerHTML = `<span style="color:#f87171;font-size:12px">${escapeHtml(e.message)}</span>`;
-      }
-      showToast(e.message, "error");
-    }
-  } finally {
-    activeDownloads.delete(key);
-    if (card.isConnected) {
-      card.dataset.downloadActive = "0";
-      btnDownload.style.display = "";
-      btnDownload.disabled = false;
-      btnCancel.style.display = "none";
-    }
-  }
-}
-
-function restoreDownloadUI(card, state) {
-  const btnDownload = $(".btn-download", card);
-  const btnCancel = $(".btn-cancel", card);
-  const status = $(".download-status", card);
-
-  btnDownload.style.display = "none";
-  btnDownload.disabled = true;
-  btnCancel.style.display = "";
-  btnCancel.textContent = "Cancel";
-  btnCancel.disabled = false;
-  card.dataset.downloadActive = "1";
-  card.classList.add("expanded");
-
-  updateProgressUI(status, state.progress);
-}
-
-function updateProgressUI(statusEl, p) {
-  if (p.phase === 'parsing' || p.phase === 'manifest') {
-    statusEl.innerHTML = renderProgressBar(0, 0, 'Parsing manifest...');
-  } else if (p.phase === 'downloading') {
-    const pct = p.total ? Math.round(p.current / p.total * 100) : 0;
-    const parts = [`File ${p.current}/${p.total}`];
-    if (p.speed) parts.push(p.speed);
-    statusEl.innerHTML = renderProgressBar(p.current, p.total,
-      parts.join(' · '),
-      p.totalWritten ? formatSize(p.totalWritten) : ''
+    const outputBaseName = await buildOutputBaseName(
+      item.title,
+      descriptor.buildVersion,
+      assetId,
+      artifactId,
     );
-  } else if (p.phase === 'file_progress') {
-    const filePct = p.fileSize ? Math.round(p.fileBytes / p.fileSize * 100) : 0;
-    statusEl.innerHTML = renderProgressBar(p.current, p.total,
-      `${p.filename?.replace(/.*\//, '')} ${filePct}%`,
-      p.totalWritten ? formatSize(p.totalWritten) : ''
-    );
-  } else if (p.phase === 'done') {
-    statusEl.innerHTML = `<span class="download-done">&#10003; ${escapeHtml(p.filename || '')} (${formatSize(p.totalWritten)})</span>`;
-  }
-}
-
-// ==================== Browser-native download (File System Access API) ====================
-
-async function handleBrowserDownload(item, resp, signal, onProgress) {
-  try {
-    onProgress({ phase: 'parsing', current: 0, total: 0, totalWritten: 0, label: 'Pick a folder...', detail: '' });
-    const dirHandle = await window.showDirectoryPicker({ mode: 'readwrite' });
-
-    if (signal.aborted) throw new DOMException('Aborted', 'AbortError');
-
-    onProgress({ phase: 'downloading', current: 0, total: 0, totalWritten: 0, label: 'Downloading...', detail: '', speed: '' });
-
-    const assetName = sanitizeFilename(item.title);
     let lastUpdate = 0;
     let lastBytes = 0;
-
-    await downloadAsset({
-      manifestUrls: resp.manifestUrls,
-      manifestBase64: resp.manifestBase64,
-      baseUrls: resp.baseUrls,
-      baseUrlTokens: resp.baseUrlTokens,
+    let lastAt = performance.now();
+    const result = await downloadAsset({
+      manifestUrls: descriptor.manifestUrls,
+      baseUrls: descriptor.baseUrls,
+      baseUrlQueries: descriptor.baseUrlQueries,
+      allowedOrigins: descriptor.allowedOrigins,
       dirHandle,
-      assetName,
-      signal,
-      onProgress: (p) => {
-        const now = Date.now();
-        const elapsed = now - lastUpdate;
-        if (elapsed < 200 && p.phase !== 'file_progress') return;
+      outputBaseName,
+      signal: controller.signal,
+      confirmLargeDownload({ payloadBytes, archiveBytes, networkBytes }) {
+        return window.confirm(
+          `This asset describes ${formatSize(payloadBytes)} of files and an estimated ` +
+          `${formatSize(archiveBytes)} TAR. CDN fallback could transfer up to ` +
+          `${formatSize(networkBytes)}. Continue?`,
+        );
+      },
+      onProgress(progress) {
+        const now = performance.now();
+        const terminal = ["done", "cancelled", "error"].includes(progress.phase);
+        if (!terminal && now - lastUpdate < 150) return;
+        const elapsed = Math.max(now - lastAt, 1);
+        const totalWritten = Number(progress.totalWritten || 0);
+        const speed = totalWritten > lastBytes
+          ? formatSpeed((totalWritten - lastBytes) / (elapsed / 1000))
+          : "";
+        lastBytes = totalWritten;
+        lastAt = now;
         lastUpdate = now;
-
-        if (p.phase === 'downloading') {
-          const speed = p.totalWritten && lastBytes && elapsed > 0
-            ? formatSpeed((p.totalWritten - lastBytes) / (elapsed / 1000))
-            : '';
-          lastBytes = p.totalWritten || 0;
-          onProgress({ ...p, speed });
-        } else if (p.phase === 'done') {
-          onProgress({ phase: 'done', totalWritten: lastBytes, filename: `${assetName}.tar` });
-        } else {
-          onProgress(p);
-        }
+        state.progress = { ...progress, jobId, speed: progress.speed || speed };
+        renderDownloadProgress(state);
       },
     });
-  } catch (fsErr) {
-    if (fsErr.name === 'AbortError' || signal.aborted) {
-      throw new DOMException('Aborted', 'AbortError');
+
+    state.progress = {
+      phase: "done",
+      jobId,
+      filename: result.filename,
+      totalWritten: result.totalBytes,
+    };
+    renderDownloadProgress(state);
+  } catch (error) {
+    const cancelled = controller.signal.aborted || error?.name === "AbortError";
+    state.progress = cancelled
+      ? { phase: "cancelled", jobId, message: "Cancelled." }
+      : { phase: "error", jobId, message: error?.message || "Download failed." };
+    renderDownloadProgress(state);
+    if (!cancelled) {
+      debug.warn("Download failed:", error?.message);
+      showToast(error?.message || "Download failed", "error");
     }
-    const detail = `${fsErr.name}: ${fsErr.message}`;
-    debug.warn('Download failed:', detail, fsErr);
-    throw fsErr;
+  } finally {
+    if (activeDownloads.get(assetId) === state) activeDownloads.delete(assetId);
+    const view = state.view;
+    if (view?.card.isConnected) {
+      view.versionSelect.disabled = false;
+      view.downloadButton.style.display = "";
+      view.downloadButton.disabled = !view.versionSelect.value;
+      view.cancelButton.style.display = "none";
+      view.cancelButton.disabled = false;
+      view.cancelButton.textContent = "Cancel";
+      view.card.dataset.downloadActive = "0";
+    }
   }
 }
 
-// ==================== Utils ====================
-function escapeHtml(str) {
-  const div = document.createElement("div");
-  div.textContent = str || "";
-  return div.innerHTML;
+function restoreDownloadUi(card, select, downloadButton, cancelButton, status, state) {
+  state.view = {
+    card,
+    versionSelect: select,
+    downloadButton,
+    cancelButton,
+    status,
+  };
+  select.value = state.artifactId;
+  select.disabled = true;
+  downloadButton.style.display = "none";
+  downloadButton.disabled = true;
+  cancelButton.style.display = "";
+  cancelButton.disabled = state.controller.signal.aborted;
+  cancelButton.textContent = state.controller.signal.aborted ? "Cancelling..." : "Cancel";
+  card.dataset.downloadActive = "1";
+  card.classList.add("expanded");
+  updateProgressUi(status, state.progress);
 }
 
-function escapeAttr(str) {
-  return (str || "").replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+function renderDownloadProgress(state) {
+  const status = state.view?.status;
+  if (status?.isConnected) updateProgressUi(status, state.progress);
 }
 
-function sanitizeFilename(name) {
-  return (name || "asset").replace(/[<>:"/\\|?*]/g, "_").replace(/\s+/g, "_").slice(0, 64);
+function updateProgressUi(status, progress) {
+  status.replaceChildren();
+  if (progress.phase === "done") {
+    status.append(createElement("span", {
+      className: "download-done",
+      text: `✓ ${progress.filename || ""} (${formatSize(progress.totalWritten)})`,
+    }));
+    return;
+  }
+  if (progress.phase === "cancelled" || progress.phase === "error") {
+    const message = createElement("span", { text: progress.message || progress.phase });
+    message.className = progress.phase === "error" ? "download-error" : "download-cancelled";
+    status.append(message);
+    return;
+  }
+
+  let label = progress.label || "Preparing download...";
+  let detail = "";
+  if (progress.phase === "downloading") {
+    label = `File ${progress.current || 0}/${progress.total || 0}`;
+    detail = [progress.speed, progress.totalWritten ? formatSize(progress.totalWritten) : ""]
+      .filter(Boolean).join(" · ");
+  } else if (progress.phase === "file_progress") {
+    const percent = progress.fileSize
+      ? Math.round((progress.fileBytes || 0) / progress.fileSize * 100)
+      : 0;
+    label = `${String(progress.filename || "").replace(/.*\//, "")} ${percent}%`;
+    detail = [progress.speed, progress.totalWritten ? formatSize(progress.totalWritten) : ""]
+      .filter(Boolean).join(" · ");
+  } else if (progress.phase === "finalizing") {
+    label = "Finalizing archive...";
+  }
+  status.append(renderProgressBar(progress.current, progress.total, label, detail));
 }
 
-// ==================== Event Listeners ====================
+function renderProgressBar(current = 0, total = 0, label = "", detail = "") {
+  const container = createElement("div", { className: "progress-container" });
+  const background = createElement("div", { className: "progress-bar-bg" });
+  const fill = createElement("div", { className: "progress-bar-fill" });
+  fill.style.width = `${total ? Math.min(100, Math.round(current / total * 100)) : 0}%`;
+  background.append(fill);
+  const text = createElement("div", {
+    className: "progress-text",
+    text: detail ? `${label} · ${detail}` : label,
+  });
+  container.append(background, text);
+  return container;
+}
+
+function sanitizeFilenamePart(value, maxLength) {
+  const sanitized = String(value || "")
+    .normalize("NFC")
+    .replace(/[<>:"/\\|?*\u0000-\u001f]/g, "_")
+    .replace(/\s+/g, "_")
+    .replace(/[. ]+$/g, "");
+  return Array.from(sanitized).slice(0, maxLength).join("") || "unknown";
+}
+
+async function buildOutputBaseName(title, buildVersion, assetId, artifactId) {
+  const identity = new TextEncoder().encode(`${assetId}\0${artifactId}`);
+  const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", identity));
+  const suffix = [...digest.subarray(0, 6)].map((value) => value.toString(16).padStart(2, "0")).join("");
+  return [
+    sanitizeFilenamePart(title || "asset", 80),
+    sanitizeFilenamePart(buildVersion || "version", 32),
+    suffix,
+  ].join("__");
+}
+
+function formatSize(bytes) {
+  if (!Number.isFinite(Number(bytes)) || Number(bytes) <= 0) return "0 B";
+  const units = ["B", "KiB", "MiB", "GiB", "TiB"];
+  let value = Number(bytes);
+  let unit = 0;
+  while (value >= 1024 && unit < units.length - 1) {
+    value /= 1024;
+    unit++;
+  }
+  return `${value.toFixed(unit === 0 ? 0 : 1)} ${units[unit]}`;
+}
+
+function formatSpeed(bytesPerSecond) {
+  if (!Number.isFinite(bytesPerSecond) || bytesPerSecond <= 0) return "";
+  return `${formatSize(bytesPerSecond)}/s`;
+}
+
 let searchTimer;
 $("#search-input").addEventListener("input", () => {
   clearTimeout(searchTimer);
   searchTimer = setTimeout(renderCards, 250);
 });
-
 $("#filter-type").addEventListener("change", renderCards);
 $("#filter-engine").addEventListener("change", renderCards);
-
-$("#btn-refresh").addEventListener("click", async () => {
-  const btn = $("#btn-refresh");
-  btn.addEventListener('animationend', () => btn.classList.remove('spin-once'), { once: true });
-  btn.classList.add('spin-once');
-  await loadLibrary(true);
-  showToast("Library refreshed");
+$("#btn-refresh").addEventListener("click", () => {
+  const button = $("#btn-refresh");
+  button.classList.add("spin-once");
+  button.addEventListener("animationend", () => button.classList.remove("spin-once"), { once: true });
+  loadLibrary(true);
 });
 
-$("#btn-login-prompt")?.addEventListener("click", () => {
-  chrome.runtime.sendMessage({ action: "auth:start" });
+chrome.runtime.onMessage.addListener((message, sender) => {
+  if (
+    sender?.id === chrome.runtime.id &&
+    message?.action === "auth:generation" &&
+    Number.isSafeInteger(message.generation) &&
+    message.generation >= 0
+  ) {
+    clearLibraryForAuthChange();
+  }
+  // This notification is one-way; no response channel is kept open.
 });
 
-// ==================== Progress Bar ====================
-function renderProgressBar(current, total, label, detail) {
-  const pct = total ? Math.round(current / total * 100) : 0;
-  const text = detail ? `${escapeHtml(label)} · ${escapeHtml(detail)}` : escapeHtml(label);
-  return `
-    <div class="progress-container">
-      <div class="progress-bar-bg"><div class="progress-bar-fill" style="width:${pct}%"></div></div>
-      <div class="progress-text"><span>${text}</span></div>
-    </div>`;
-}
+window.addEventListener("pagehide", () => {
+  abortActiveDownloads();
+});
 
-function formatSize(bytes) {
-  if (!bytes || bytes === 0) return '0 B';
-  const u = ['B', 'KB', 'MB', 'GB'];
-  let i = 0;
-  let v = bytes;
-  while (v >= 1024 && i < u.length - 1) { v /= 1024; i++; }
-  return `${v.toFixed(i === 0 ? 0 : 1)} ${u[i]}`;
+const missing = missingBrowserFeatures();
+if (missing.length > 0) {
+  showEmptyMessage(`Unsupported Chrome version. Missing: ${missing.join(", ")}. Chrome 103 or newer is required.`);
+  $("#btn-refresh").disabled = true;
+} else {
+  loadLibrary();
 }
-
-function formatSpeed(bps) {
-  if (!bps || bps <= 0 || !isFinite(bps)) return '';
-  const u = ['B/s', 'KB/s', 'MB/s', 'GB/s'];
-  let i = 0;
-  let v = bps;
-  while (v >= 1024 && i < u.length - 1) { v /= 1024; i++; }
-  return `${v.toFixed(1)} ${u[i]}`;
-}
-
-// ==================== Init ====================
-loadLibrary();

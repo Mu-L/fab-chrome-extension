@@ -1,103 +1,113 @@
-// Content script injected into Epic OAuth redirect page.
-// Auto-extracts the authorizationCode from the JSON response body.
-// Runs at document_end on https://www.epicgames.com/id/api/redirect*
-
+// Content script injected into Epic's OAuth redirect response.
 (function () {
   "use strict";
 
   const DEBUG = false;
-  const dbg = (...args) => { if (DEBUG) console.log('[Fab]', ...args); };
+  const MAX_OAUTH_BODY_CHARS = 16 * 1024;
+  const dbg = (...args) => { if (DEBUG) console.log("[Fab]", ...args); };
 
   if (window.__fabOAuthProcessed) return;
   window.__fabOAuthProcessed = true;
 
-  function extractCode() {
+  function extractResult() {
     try {
-      // Epic's redirect page returns JSON directly in the body
-      // It may be wrapped in <pre> or just raw text
-      const bodyText = document.body?.innerText || document.body?.textContent || "";
-      if (!bodyText.trim()) return null;
-
-      // Try to parse as JSON
+      const bodyText = document.body?.textContent || "";
+      if (bodyText.length > MAX_OAUTH_BODY_CHARS) return null;
       const trimmed = bodyText.trim();
-      if (trimmed.startsWith("{")) {
-        const data = JSON.parse(trimmed);
-        if (data.authorizationCode && typeof data.authorizationCode === "string") {
-          return data.authorizationCode;
-        }
+      if (!trimmed.startsWith("{")) return null;
+
+      const data = JSON.parse(trimmed);
+      const code = typeof data.authorizationCode === "string" ? data.authorizationCode.trim() : "";
+      const state = typeof data.state === "string" ? data.state : "";
+      if (code.length >= 10 && code.length <= 512 && state.length <= 512) {
+        return { code, state };
       }
     } catch {
-      dbg('OAuth capture: body not JSON yet (user likely on login form)');
+      dbg("OAuth response is not ready yet");
     }
     return null;
   }
 
-  function notifyBackground(code) {
-    chrome.runtime.sendMessage({ action: "auth:code", code }, (response) => {
+  function renderResult({ success, title, message, detail }) {
+    const container = document.createElement("main");
+    Object.assign(container.style, {
+      display: "flex",
+      flexDirection: "column",
+      alignItems: "center",
+      justifyContent: "center",
+      minHeight: "100vh",
+      fontFamily: "-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif",
+      background: "#16161a",
+      color: "#d4d4d8",
+      textAlign: "center",
+      padding: "2rem",
+      boxSizing: "border-box",
+    });
+
+    const icon = document.createElement("div");
+    icon.textContent = success ? "✓" : "⚠";
+    icon.style.cssText = "font-size:4rem;margin-bottom:1rem";
+
+    const heading = document.createElement("h1");
+    heading.textContent = title;
+    heading.style.cssText = `color:${success ? "#5ad8a0" : "#e08888"};margin-bottom:.5rem`;
+
+    const body = document.createElement("p");
+    body.textContent = message;
+    body.style.cssText = "font-size:1.1rem;color:#88889a";
+
+    const footer = document.createElement("p");
+    footer.textContent = detail;
+    footer.style.cssText = "color:#6a6a7e;margin-top:2rem";
+
+    container.append(icon, heading, body, footer);
+    document.body.replaceChildren(container);
+  }
+
+  function notifyBackground(result) {
+    chrome.runtime.sendMessage({ action: "auth:code", ...result }, (response) => {
       if (chrome.runtime.lastError) {
-        console.warn("Fab Extension: Failed to send code to background:", chrome.runtime.lastError.message);
+        console.warn("Fab Extension: Failed to finish OAuth:", chrome.runtime.lastError.message);
+        renderResult({
+          success: false,
+          title: "Authentication Failed",
+          message: "The extension could not finish the login transaction.",
+          detail: "Please try again from the Fab Downloader popup.",
+        });
         return;
       }
+
       if (response?.status === "ok") {
-        // Replace page with success message
-        document.body.innerHTML = `
-          <div style="
-            display: flex; flex-direction: column; align-items: center; justify-content: center;
-            min-height: 100vh; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-            background: #16161a; color: #d4d4d8; text-align: center; padding: 2rem;
-          ">
-            <div style="font-size: 4rem; margin-bottom: 1rem;">&#10003;</div>
-            <h1 style="color: #5ad8a0; margin-bottom: 0.5rem;">Login Successful!</h1>
-            <p style="font-size: 1.1rem; color: #88889a;">
-              Logged in as <strong style="color: #d4d4d8;">${escapeHtml(response.displayName)}</strong>
-            </p>
-            <p style="color: #6a6a7e; margin-top: 2rem;">You can close this tab and return to the Fab Downloader extension.</p>
-          </div>
-        `;
+        renderResult({
+          success: true,
+          title: "Login Successful!",
+          message: `Logged in as ${response.displayName || "Epic user"}`,
+          detail: "You can close this tab and return to the Fab Downloader extension.",
+        });
       } else {
-        // Show error state
-        document.body.innerHTML = `
-          <div style="
-            display: flex; flex-direction: column; align-items: center; justify-content: center;
-            min-height: 100vh; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-            background: #16161a; color: #d4d4d8; text-align: center; padding: 2rem;
-          ">
-            <div style="font-size: 4rem; margin-bottom: 1rem;">&#9888;</div>
-            <h1 style="color: #e08888; margin-bottom: 0.5rem;">Authentication Failed</h1>
-            <p style="color: #88889a;">${escapeHtml(response?.message || "Unknown error")}</p>
-            <p style="color: #6a6a7e; margin-top: 2rem;">Please try again from the Fab Downloader popup.</p>
-          </div>
-        `;
+        renderResult({
+          success: false,
+          title: "Authentication Failed",
+          message: response?.message || "Unknown error",
+          detail: "Please try again from the Fab Downloader popup.",
+        });
       }
     });
   }
 
-  function escapeHtml(str) {
-    const div = document.createElement("div");
-    div.textContent = str;
-    return div.innerHTML;
-  }
-
-  // Try immediately
-  const code = extractCode();
-  if (code) {
-    notifyBackground(code);
+  const initialResult = extractResult();
+  if (initialResult) {
+    notifyBackground(initialResult);
     return;
   }
 
-  // If not found, observe the DOM for changes (login form → redirect → JSON)
   const observer = new MutationObserver(() => {
-    const code = extractCode();
-    if (code) {
-      observer.disconnect();
-      notifyBackground(code);
-    }
+    const result = extractResult();
+    if (!result) return;
+    observer.disconnect();
+    notifyBackground(result);
   });
 
   observer.observe(document.body, { childList: true, subtree: true, characterData: true });
-
-  // Timeout after 120 seconds
-  setTimeout(() => {
-    observer.disconnect();
-  }, 120000);
+  setTimeout(() => observer.disconnect(), 5 * 60 * 1000);
 })();
