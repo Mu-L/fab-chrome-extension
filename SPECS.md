@@ -20,7 +20,11 @@ Epic OAuth redirect page
 
 The Service Worker is the only context that handles OAuth token exchange, refresh credentials, and Bearer-authenticated Fab API calls. The Library page downloads public or signed Manifest/chunk URLs directly under extension host permissions. No generic URL-fetch proxy is exposed through runtime messaging.
 
-The extension has no developer backend, analytics endpoint, externally connectable messaging surface, or Chrome Web Store integration.
+The extension has no developer backend, analytics or telemetry code/endpoint, externally connectable messaging surface, or Chrome Web Store integration.
+
+Asset authorization remains controlled by Epic/Fab. The extension only presents artifacts returned for the authenticated account; it does not grant ownership or access to additional content.
+
+Library cards may embed HTTPS thumbnail URLs returned by the Fab API, including hosts such as `media.fab.com`. These are ordinary `<img>` requests with `referrerPolicy: no-referrer`, not authenticated API or downloadable-content requests. Thumbnail URLs are accepted only when they use HTTPS and contain no user information. They do not require an extension host permission, are not covered by the download descriptor origin allowlist, and are never read through canvas or another pixel-access API.
 
 ## 2. Components
 
@@ -92,6 +96,8 @@ There is no manual authorization-code input or generic code-exchange message.
 
 Both storage areas use `TRUSTED_CONTEXTS`, preventing direct Content Script access. A Service Worker restart retains session storage; a browser restart can retain only the refresh credential, so the worker obtains a new access credential before authenticated API use.
 
+Chrome extension storage is not an operating-system-backed secret vault. `TRUSTED_CONTEXTS` prevents direct Content Script reads, but software or a person with access to the operating-system account or Chrome profile may still recover the persisted refresh credential. Chrome profiles, extension storage dumps, real tokens, authorization codes, and signed URL query values must not be committed, packaged, or shared.
+
 ### 4.3 Refresh and logout
 
 At most one refresh request is active for an account and authentication epoch; concurrent consumers share the same Promise. Each login, refresh, and code exchange captures the current authentication epoch. A completed interactive login commits its new refresh credential and atomically advances the session epoch with the matching access credential. Refresh writes use the captured epoch, so an old-account refresh cannot overwrite that login or a logout regardless of response order.
@@ -101,6 +107,14 @@ An explicit OAuth `invalid_grant` clears credentials only if the initiating epoc
 Logout increments the epoch before clearing access, refresh, and pending OAuth records. It also clears the Library cache for the authenticated account.
 
 Authentication-generation changes are broadcast to open extension pages without a token or account identifier. An open Library page clears its in-memory model and DOM, invalidates pending folder-picker continuations, and aborts direct downloads before accepting work for another generation.
+
+### 4.4 Shared OAuth client identity
+
+The source contains the fixed `launcherAppClient2` OAuth client ID and client secret used for Epic Games Launcher-compatible token exchange. The client secret is an OAuth Basic-authentication credential, not an SSL/TLS private key, certificate, or content-encryption key. It is shared client material and does not change with the installation machine or extension installation.
+
+Because the credential must be present in a distributed client, the design does not treat its confidentiality as a security boundary. Wider disclosure can nevertheless increase the chance of copying, abuse, rate limiting, identification, rotation, or revocation, any of which may break login compatibility. The repository should therefore remain private for normal operation, and the credential should not be repeated in logs, screenshots, release notes, or discussions.
+
+This specification does not establish that Epic imposes an enforceable confidentiality or non-reuse obligation on this shared client identity. It is not legal advice and does not imply authorization from Epic; maintainers and users remain responsible for checking the terms and law applicable to them.
 
 ## 5. Account-scoped Library cache
 
@@ -269,6 +283,8 @@ All Manifest paths are validated before the first archive byte is written. Valid
 
 Regular paths use USTAR headers and 512-byte alignment. Valid UTF-8 paths that do not fit USTAR and file sizes that do not fit the octal size field use POSIX PAX extended headers. Paths and sizes are never silently truncated.
 
+The selected directory is used to create and stream the final TAR; chunks remain in the bounded per-job memory cache rather than being staged as temporary files in that directory. A single TAR also avoids asking Chrome to create every executable, plugin, or library file such as `.dll` and `.exe` individually.
+
 The output name is:
 
 ```text
@@ -279,6 +295,8 @@ The random suffix compensates for the File System Access API's lack of an exclus
 
 `FileSystemWritableFileStream.close()` is called only after two zero TAR terminator blocks and successful file verification. Network, parser, integrity, cancellation, or disk errors call `abort()`. Abort and deletion each have a bounded cleanup wait. A newly created incomplete output is removed when the API permits; if cleanup fails, the job becomes an error and names the file that may require manual deletion. It is never reported as done.
 
+Structural and hash validation establishes that the archive matches the accepted Manifest; it does not establish that the asset is safe to execute. A TAR may contain executables, plugins, or scripts. Users should inspect archives with trusted tools, extract into an isolated directory, and avoid overwriting important projects or system paths.
+
 ## 10. Permissions and network destinations
 
 | Permission or host | Purpose |
@@ -288,19 +306,50 @@ The random suffix compensates for the File System Access API's lack of an exclus
 | Epic account public service | OAuth token exchange and refresh |
 | `www.fab.com` | Authenticated Library and artifact Manifest metadata |
 | Fastly, Akamai, and Epic CloudFront CDN hosts | Direct signed Manifest and chunk download |
+| Fab-provided HTTPS thumbnail hosts | Ordinary `no-referrer` Library card image loads; no pixel read |
 | User-selected directory handle | Create one non-overwriting TAR output |
 
 Host permissions are a maximum capability, not sufficient authorization for a request. Descriptor-origin checks and validation of the locally derived chunk path remain mandatory.
 
-## 11. Manual release contract
+Fab-provided thumbnail hosts are not extension host permissions and are not download destinations. They receive the browser's ordinary image request for the HTTPS URL supplied by Fab. Extension code does not attach an OAuth Bearer credential or explicitly attach or read cookies, although Chrome may apply its normal ambient-cookie policy to the image request.
 
-The supported distribution is a manually reviewed ZIP loaded through Chrome Developer mode. A release contains runtime extension files, documentation, and the repository `LICENSE`; it excludes repository metadata, logs, tests, downloads, profiles, tokens, authorization codes, and complete signed URLs.
+## 11. Manual verification and release contract
 
-Release acceptance requires:
+### 11.1 Distribution model
 
-- JavaScript syntax checks;
-- local synthetic validation of authentication races, pagination, parser bounds, integrity failure, TAR/PAX paths, scheduler limits, cancellation, and collision-resistant output behavior;
-- Chrome smoke tests for login/restart/logout, account cache isolation, stale refresh fallback, directory-picker cancellation, one JSON Manifest asset, one binary Manifest asset, and a large download;
-- a live, redacted compatibility check for OAuth state/PKCE switches, CDN signed-query and redirect behavior, current Manifest/chunk versions, and the Fab `manifestHash` field.
+The project has no automatic CI release, automatic GitHub Release, or Chrome Web Store publication. The supported distribution is a manually reviewed ZIP loaded through Chrome Developer mode. The ZIP root must directly contain `manifest.json`.
+
+A release uses an explicit file allowlist. It contains the runtime extension files and assets plus:
+
+- `README.md`;
+- `SPECS.md`;
+- `LICENSE`.
+
+It excludes `.git`, `.github`, tests, logs, download outputs, Chrome profiles, temporary files, real tokens, authorization codes, storage dumps, and complete signed URLs. Before publication, the maintainer inspects the archive file list and performs one final **Load unpacked** smoke test from the extracted ZIP.
+
+### 11.2 Manual Chrome smoke test
+
+Before a manual release, use a dedicated Chrome test profile to verify:
+
+- a clean extracted directory loads without popup, Library, Service Worker, or console startup errors;
+- login succeeds, while reloading or resubmitting the same OAuth callback cannot complete login again;
+- closing and reopening Chrome restores the session through the refresh credential, and `chrome.storage.local` contains no access token;
+- logout returns the popup to the logged-out state, clears credentials, removes the previous account cache, clears open Library cards, and stops active downloads;
+- two different accounts never display each other's cached Library data;
+- a normal multi-page Library refresh completes, while a failed offline refresh visibly retains only a previous complete stale snapshot;
+- cancelling the directory picker creates no job or output and sends no Manifest or chunk request;
+- at least one JSON Manifest asset and one supported unencrypted binary Manifest asset download successfully, with the observed feature and chunk-header versions recorded in a redacted test note; extract each TAR, compare its file count with the accepted Manifest, and confirm the completion message reports the actual output;
+- binary feature 22+ and chunk header v4+ remain fail-closed until real fixtures and authentication rules justify support;
+- two versions of one asset produce different output names, and repeated downloads of one version receive different random suffixes without overwriting the previous file;
+- cancelling an active download stops its network requests and never reports an incomplete archive as successful; a cleanup failure names the exact file requiring manual removal;
+- a large real asset keeps active chunk requests at or below six per job and does not show unbounded chunk-memory growth in Chrome Task Manager;
+- rejecting a synthetic workload above the 32 GiB confirmation threshold creates no TAR and requests no chunk;
+- a redacted live compatibility check covers signed-query forwarding, redirect behavior, current Manifest/chunk versions, and the Fab `manifestHash` field.
+
+### 11.3 Local validation boundary
+
+JavaScript syntax checks and local synthetic fixtures cover authentication races, pagination bounds, malformed Manifest structures, decompression limits, integrity failures, dangerous TAR/PAX paths, scheduler limits, cancellation, size confirmation, and collision-resistant output naming.
+
+Malformed Manifest data, invalid hashes, unsafe paths, and oversized responses are tested locally. Tests must not deliberately send abnormal payloads to Epic or Fab services. Live compatibility records must remove credentials, tokens, authorization codes, account identifiers, and signed query values.
 
 No commit, tag, ZIP creation, or manual test result implies permission to push. The reviewed commit range is pushed only after explicit user approval of that exact revision.
