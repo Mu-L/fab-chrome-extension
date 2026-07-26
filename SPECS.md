@@ -1,130 +1,306 @@
 # Fab Content Downloader — Technical Specification
 
-## Architecture
+## 1. System boundaries
 
-```
-┌────────────────────────────────────────────────────┐
-│ Chrome Extension (Manifest V3)                     │
-│                                                    │
-│  popup/          library/        background/       │
-│  (auth UI)       (browse + DL)   (service worker)  │
-│     │                │                │            │
-│     └──────┬─────────┘       ┌────────┘            │
-│            │                 │                      │
-│     chrome.storage     chrome.runtime              │
-│         .local         .sendMessage()               │
-│                            │                        │
-│              ┌─────────────┴──────────┐            │
-│              │   proxy:fetch/batch    │            │
-│              ▼                        ▼            │
-│     ┌──────────────┐    ┌──────────────────────┐   │
-│     │ Fab REST API  │    │ Epic CDNs (3 mirrors) │   │
-│     │ www.fab.com   │    │ Fastly/Akamai/CF      │   │
-│     └──────────────┘    └──────────────────────┘   │
-└────────────────────────────────────────────────────┘
+Fab Content Downloader is a Chrome Manifest V3 extension with four execution contexts:
+
+```text
+Popup ───────────────┐
+                     │ authenticated runtime messages
+Library page ────────┼────────► Service Worker ─────► Epic OAuth / Fab API
+        │            │
+        │            │
+        └────────────┘
+        │
+        └──── validated HTTPS fetch ────────────────► Epic CDN
+
+Epic OAuth redirect page
+        └──── top-frame Content Script ─────────────► Service Worker
 ```
 
-## Module Map
+The Service Worker is the only context that handles OAuth token exchange, refresh credentials, and Bearer-authenticated Fab API calls. The Library page downloads public or signed Manifest/chunk URLs directly under extension host permissions. No generic URL-fetch proxy is exposed through runtime messaging.
 
-| File | Role |
-|---|---|
-| `manifest.json` | MV3 manifest: permissions, content scripts, icons |
-| `background/service-worker.js` | Auth lifecycle, Fab API proxy, CDN fetch proxy (batch), manifest binary fetch |
-| `content/oauth-capture.js` | Auto-extract Epic authorizationCode from redirect page |
-| `popup/popup.{html,js,css}` | Auth status dashboard, login/logout, manual code input |
-| `library/library.{html,js,css}` | Asset browser: card grid, search, filter, version select, download trigger, progress bar |
-| `lib/auth.js` | Epic OAuth client: authorization_code exchange, token refresh, UA spoofing |
-| `lib/storage.js` | chrome.storage.local wrapper with TTL (24h library cache) |
-| `lib/browser-manifest-parser.js` | Manifest parser for binary (magic `0x44BEC00C`) and JSON formats, chunk decompression, SHA1 via Web Crypto, chunk URL builder |
-| `lib/debug.js` | Gated debug logging utility (DEBUG flag) |
-| `vendor/fab-download-browser.js` | Chunk downloader (batched proxy, 16-concurrent, 3-CDN pool), TAR archive builder (USTAR, 512-byte padding), SHA1 verification per file |
+The extension has no developer backend, analytics endpoint, externally connectable messaging surface, or Chrome Web Store integration.
 
-## Manifest Formats
+## 2. Components
 
-Epic uses two manifest formats depending on the asset type:
+| Component | Responsibility |
+| --- | --- |
+| `manifest.json` | MV3 entry points, Chrome 103 minimum version, storage and HTTPS host permissions |
+| `popup/` | Login status, starting OAuth, logout, and opening the Library |
+| `content/oauth-capture.js` | Reads an Epic redirect result in the expected top-level OAuth tab and submits one authorization code |
+| `background/service-worker.js` | Message authorization, OAuth lifecycle, account-scoped Library synchronization, authenticated Fab API calls, and download descriptor creation |
+| `library/` | Library rendering, filters, immutable download jobs, directory selection, direct Manifest/CDN requests, cancellation, and user-visible status |
+| `lib/auth.js` | OAuth request construction, code exchange, refresh, and token validation |
+| `lib/storage.js` | Trusted-context token storage, OAuth transaction state, authentication generation, and IndexedDB Library cache |
+| `lib/browser-manifest-parser.js` | Bounded JSON/binary Manifest parsing, chunk decoding, metadata validation, and streaming file hashing |
+| `vendor/fab-download-browser.js` | Bounded chunk scheduler and TAR/PAX writer |
 
-### Binary format (newer assets)
+## 3. Trust model and message ACL
 
-Magic header `0x44BEC00C`. Compressed binary structure with separate `chunkDataList` containing per-chunk metadata (`hash`, `groupNumber`, `shaHash`). Chunks stored at:
+Every runtime request is treated as untrusted input. The router validates:
 
+- `sender.id` equals the current extension ID;
+- the sender context and exact extension page path;
+- the OAuth sender URL, tab ID, and top-frame `frameId`;
+- action-specific field types, lengths, counts, and unknown fields;
+- the current authentication epoch and pending transaction where applicable.
+
+The action allowlist is:
+
+| Sender | Allowed actions |
+| --- | --- |
+| Popup page | `auth:start`, `auth:status`, `auth:logout`, `library:status` |
+| Library page | `library:list`, `library:refresh`, `manifest:prepare`, `manifest:cancel` |
+| Expected Epic OAuth top-frame Content Script | `auth:code` for the current pending transaction |
+| Any other sender | None |
+
+Responses never include an access token, refresh token, OAuth verifier, client secret, or authorization code. Logs omit Bearer credentials and URL query strings. The OAuth callback receives only the display name needed for its success message; no account identifier or credential is broadcast.
+
+## 4. OAuth and authentication lifecycle
+
+### 4.1 Login transaction
+
+Starting login creates a cryptographically random transaction ID and an OAuth tab. The pending transaction is stored in `chrome.storage.session` with:
+
+- transaction ID;
+- OAuth tab ID and top-frame ID;
+- creation and expiry timestamps;
+- current authentication epoch;
+- optional OAuth `state`;
+- optional PKCE code verifier.
+
+The transaction expires after at most five minutes. The callback must come from the bound Epic redirect URL, the exact tab, and frame `0`. A matching callback atomically consumes the transaction before code exchange; it cannot be replayed. A callback that fails sender, transaction, expiry, or optional state validation is rejected without consuming a different valid transaction.
+
+Two independent compatibility switches govern Epic endpoint capabilities:
+
+- **State switch:** adds a random `state` to the authorization request and requires an exact callback match.
+- **PKCE switch:** derives an S256 code challenge from a random verifier and supplies the verifier during code exchange.
+
+Each switch is enabled only for an endpoint behavior confirmed by the manual live compatibility test. Tab/frame binding, five-minute expiry, one-time consumption, and authentication-epoch checks apply in every configuration.
+
+There is no manual authorization-code input or generic code-exchange message.
+
+### 4.2 Token placement
+
+| Record | Storage | Fields |
+| --- | --- | --- |
+| Refresh credential | `chrome.storage.local` | `refreshToken`, `accountId`, optional `refreshExpiresAt` |
+| Access credential | `chrome.storage.session` | `accessToken`, `accountId`, optional `displayName`, `expiresAt`, `authEpoch` |
+| Pending OAuth | `chrome.storage.session` | Transaction fields described above |
+| Authentication epoch | `chrome.storage.session` | Non-negative safe integer |
+
+Both storage areas use `TRUSTED_CONTEXTS`, preventing direct Content Script access. A Service Worker restart retains session storage; a browser restart can retain only the refresh credential, so the worker obtains a new access credential before authenticated API use.
+
+### 4.3 Refresh and logout
+
+At most one refresh request is active for an account and authentication epoch; concurrent consumers share the same Promise. Each login, refresh, and code exchange captures the current authentication epoch. A completed interactive login commits its new refresh credential and atomically advances the session epoch with the matching access credential. Refresh writes use the captured epoch, so an old-account refresh cannot overwrite that login or a logout regardless of response order.
+
+An explicit OAuth `invalid_grant` clears credentials only if the initiating epoch still matches. Network errors, timeouts, rate limits, and 5xx responses keep the refresh credential intact so the user can retry.
+
+Logout increments the epoch before clearing access, refresh, and pending OAuth records. It also clears the Library cache for the authenticated account.
+
+Authentication-generation changes are broadcast to open extension pages without a token or account identifier. An open Library page clears its in-memory model and DOM, invalidates pending folder-picker continuations, and aborts direct downloads before accepting work for another generation.
+
+## 5. Account-scoped Library cache
+
+Library data is stored in the `fab-library-cache` IndexedDB database.
+
+| Object store | Key | Contents |
+| --- | --- | --- |
+| `libraryItems` | `[accountId, assetId]` | Account ID, asset ID, stable position, and a UI-normalized `LibraryItem` |
+| `libraryMeta` | `accountId` | `schemaVersion`, `cachedAt`, `totalCount`, and `complete: true` |
+
+`LibraryItem` contains only fields needed by the UI: asset identity and namespace, title, seller/type labels, HTTPS image references, and project-version artifact/engine/platform metadata.
+
+Replacing a cache uses one read/write transaction across both stores:
+
+1. remove records for the target account;
+2. write the complete normalized item set;
+3. write `complete: true` metadata;
+4. commit atomically.
+
+A failed transaction preserves the previous complete snapshot. A snapshot is current for 24 hours; an older complete snapshot may be returned as a visibly stale network-failure fallback. Expiry does not itself delete the account-scoped snapshot. Logout, account switch, or extension removal performs that lifecycle cleanup. Incomplete, wrong-schema, count-mismatched, duplicate-ID, or cross-account records are never displayed.
+
+Failure to persist the cache does not turn a successful network response into a Library failure. The response carries `cacheSaved: false`, and the fresh in-memory items remain usable.
+
+## 6. Library synchronization
+
+The Service Worker requests pages from the authenticated account endpoint with `count=100`. One synchronization enforces:
+
+- 30-second timeout per page;
+- five-minute total deadline;
+- at most 500 pages;
+- at most 50,000 unique assets;
+- a bounded string cursor;
+- repeated-cursor detection;
+- no-progress page detection;
+- response-shape and safe-integer validation;
+- deduplication by `assetId`.
+
+HTTP 429 and retryable 5xx responses are retried at most twice. `Retry-After` is honored within the total deadline. A failure never stores a partial snapshot.
+
+The Library page associates each request with a monotonically increasing UI generation. Results from an older generation are ignored. Refresh keeps the current grid visible and disables duplicate refresh requests. Search and filters evaluate the complete result set, while at most 1,000 matching cards are mounted at once; the count asks the user to narrow larger result sets.
+
+Library results use:
+
+```text
+status: ok | auth_expired | error
+source: network | cache | stale
+cacheSaved: boolean
+warning?: string
 ```
-{baseUrl}/ChunksV4/{group:02d}/{hash:016X}_{GUID:032X}.chunk
+
+Only `source: network` produces a “refresh succeeded” message. `source: stale` explicitly tells the user that a previous complete snapshot is being displayed.
+
+## 7. Download descriptor and network policy
+
+### 7.1 Preparation
+
+Directory selection is the first asynchronous operation after a download click. Cancelling the picker creates no job, network request, or output file.
+
+After selection, the Library page creates an immutable `jobId` and sends artifact identity to `manifest:prepare`. The Service Worker:
+
+1. obtains a valid access token;
+2. calls the Bearer-authenticated Fab artifact endpoint;
+3. validates the response and distribution points;
+4. returns a `DownloadDescriptor` without any OAuth credential.
+
+The descriptor contains artifact/build identity, up to four candidate signed Manifest URLs, chunk base URLs, per-origin Manifest query values, the Fab-provided `manifestHash` field when present, and the exact allowed CDN origins for that job. The live compatibility test must establish the hash field's encoding and whether it covers raw Manifest bytes before it can be used as an additional trust anchor.
+
+### 7.2 Direct fetch policy
+
+The Library page fetches Manifest and chunk bytes directly. Every request must satisfy all of:
+
+- HTTPS scheme;
+- no URL user information;
+- origin present in the static extension CDN allowlist;
+- origin present in the current `DownloadDescriptor`;
+- redirects are rejected; the requested and final `response.url` must remain on the approved origin.
+
+The current compatibility policy pairs each base URL with the first Manifest URL returned for the same origin, then forwards that Manifest query to every derived chunk URL for that pair. Query values are never logged. The release compatibility test must confirm this same-origin pairing and whether signed and unsigned forms produce identical bytes; there is no unverified per-path policy claim.
+
+All requests use a job-owned `AbortSignal`, an operation timeout, and a body-size limit. Cancelling a job aborts active fetches rather than only suppressing UI updates.
+
+### 7.3 Scheduler and memory budget
+
+The Library permits at most two simultaneous download jobs. Each job scheduler allows at most six active chunk requests. It prefetches only chunks near the next TAR write position, examines at most 128 part references per lookahead operation, deduplicates requests for the same GUID, and guarantees every queued Promise settles as success, failure, or cancellation.
+
+Compressed, in-flight, and decompressed cached chunk data are accounted against a 128 MiB job budget. Least-recently-used data with no active consumer is evicted before starting more work. TAR entries are written in Manifest order even when network requests complete out of order.
+
+The job state machine is:
+
+```text
+picking → preparing → parsing → downloading → finalizing → done
+                                      └───────────────→ cancelled
+                         any non-cancel failure ──────→ error
 ```
 
-Directory version determined by manifest version field (>=22 → ChunksV5, >=15 → ChunksV4).
+The Library page associates every progress update with its immutable job state. Final completion is never throttled and includes the actual output name and byte count.
 
-### JSON format (older / engine-plugin assets)
+## 8. Parsing and integrity
 
-Plain JSON with PascalCase fields. Chunk metadata stored in top-level sections:
+### 8.1 Resource limits
 
-| Section | Content |
-|---|---|
-| `ChunkHashList` | 64-bit rolling hash (decimal-encoded bytes) |
-| `ChunkShaList` | SHA1 hash (hex) |
-| `ChunkFilesizeList` | Compressed chunk size |
-| `DataGroupList` | Chunk group number |
+| Resource | Limit |
+| --- | ---: |
+| Raw Manifest response | 64 MiB |
+| JSON Manifest | 32 MiB |
+| Decompressed binary Manifest | 128 MiB |
+| Manifest chunks / files / total parts | 65,536 / 65,536 / 524,288 |
+| Compressed chunk payload | 64 MiB |
+| Fetched chunk response | Declared `fileSize`, at most 128 MiB + 64 KiB |
+| Decompressed chunk payload | 128 MiB |
+| Large-work confirmation threshold | 32 GiB estimated TAR or chunk transfer |
+| Total described file payload | 512 GiB |
+| Estimated TAR/PAX output | 520 GiB |
+| Worst-case chunk transfer across CDN fallback | 512 GiB |
+| Unique Library assets | 50,000 |
 
-All numeric values (hash, offset, size, file size) are decimal-encoded bytes (3 digits per byte, little-endian). Chunks stored at:
+Decompression uses an output-counting stream and fails closed when a limit, format check, or declared length is violated. Decompression errors are never interpreted as uncompressed input.
 
+Manifest preflight rejects empty parts and computes payload, TAR/PAX headers, padding, terminators, and a conservative chunk-transfer upper bound before creating the output or requesting a chunk. The network bound includes one possible prefetch per GUID, one possible acquisition per part, and every CDN fallback candidate. An archive or transfer estimate above 32 GiB requires explicit user confirmation; the 512/520 GiB hard limits cannot be overridden.
+
+### 8.2 Manifest formats
+
+The parser auto-detects:
+
+- Epic binary Manifest magic `0x44BEC00C`;
+- JSON Manifest structures with Epic PascalCase metadata.
+
+JSON feature levels through 13 and unencrypted binary feature levels through 21 are accepted. Known binary section versions and chunk headers v1–v3 are parsed fail closed. Binary feature 22+ introduces encryption-related semantics, and chunk header v4+ is rejected until a real format fixture and authentication rules are implemented.
+
+Every reader is bounded to its containing section. Counts, offsets, sizes, GUIDs, hashes, strings, and section boundaries must be representable as safe integers and fit within available bytes and configured limits. Unknown versions, mandatory flags, or trailing structural contradictions reject the Manifest. Large normalization loops and streaming SHA-1 periodically yield and re-check cancellation.
+
+Chunk paths are derived only from validated metadata:
+
+```text
+{baseUrl}/{Chunks|ChunksV2|ChunksV3|ChunksV4}/{group}/{hash}_{guid}.chunk
 ```
-{baseUrl}/ChunksV3/{group:02d}/{hash:016X}_{GUID:032X}.chunk
+
+The selected layout through `ChunksV4` follows the validated unencrypted Manifest feature level.
+
+### 8.3 Chunk and file validation
+
+For each chunk, the downloader validates:
+
+- expected URL origin and path;
+- chunk magic, header size, storage flags, and supported compression;
+- GUID against the requested chunk;
+- declared compressed and uncompressed sizes against actual bytes;
+- part offset and length against the decompressed payload;
+- rolling-hash metadata consistency between Manifest and chunk header;
+- chunk payload SHA-1 when a non-zero SHA-1 is provided by the Manifest or header.
+
+The Epic rolling hash is not recomputed from payload bytes. Final integrity therefore does not rely on it: for each file, all referenced parts must cover exactly the declared file size, and file SHA-1 must be present, non-zero, correctly encoded, and equal the streaming SHA-1 computed while writing. Any mismatch aborts the whole job and the output writer.
+
+## 9. TAR/PAX output
+
+All Manifest paths are validated before the first archive byte is written. Validation rejects:
+
+- empty, absolute, UNC, or drive-qualified paths;
+- `.` or `..` segments;
+- NUL and control characters;
+- Windows alternate-data-stream syntax;
+- Windows reserved device names;
+- segments ending in a dot or space;
+- collisions after slash normalization, Unicode normalization, and Windows case folding;
+- file-versus-directory prefix conflicts such as `a` and `a/b`.
+
+Regular paths use USTAR headers and 512-byte alignment. Valid UTF-8 paths that do not fit USTAR and file sizes that do not fit the octal size field use POSIX PAX extended headers. Paths and sizes are never silently truncated.
+
+The output name is:
+
+```text
+<sanitized-title>__<build-version>__<stable-asset-artifact-hash>__<96-bit-random>.tar
 ```
 
-## Key API Endpoints
+The random suffix compensates for the File System Access API's lack of an exclusive-create primitive across tabs and external processes. The extension also checks the chosen name and reserves it within the current page. This makes accidental collision negligible but is not a formal atomic no-overwrite guarantee against a process deliberately racing the exact generated name. Cleanup targets only that job's unpredictable filename.
 
-| Operation | Method | URL | Context |
-|---|---|---|---|
-| OAuth redirect | GET | `www.epicgames.com/id/api/redirect?clientId=...&responseType=code` | Browser tab |
-| Token exchange | POST | `account-public-service-prod03.ol.epicgames.com/account/api/oauth/token` | Service worker |
-| Library listing | GET | `www.fab.com/e/accounts/{id}/ue/library?count=100` | Service worker |
-| Manifest | POST | `www.fab.com/e/artifacts/{artifactId}/manifest` | Service worker |
-| Manifest file | GET | CDN signed URL (`.manifest` file) | Service worker |
-| Chunk download | GET | `{base}/ChunksV{x}/{group}/{hash}_{guid}.chunk` | Service worker (proxy) |
+`FileSystemWritableFileStream.close()` is called only after two zero TAR terminator blocks and successful file verification. Network, parser, integrity, cancellation, or disk errors call `abort()`. Abort and deletion each have a bounded cleanup wait. A newly created incomplete output is removed when the API permits; if cleanup fails, the job becomes an error and names the file that may require manual deletion. It is never reported as done.
 
-## Auth Flow
+## 10. Permissions and network destinations
 
-1. Popup → `chrome.runtime.sendMessage("auth:start")` → SW opens Epic OAuth URL in new tab
-2. Content script (`oauth-capture.js`) injects into the redirect page, detects `authorizationCode` JSON
-3. Content script → `sendMessage("auth:code", { code })` → SW exchanges for tokens
-4. SW stores `{ accessToken, refreshToken, accountId, displayName }` in `chrome.storage.local`
-5. Auto-refresh when token < 5 min from expiry
+| Permission or host | Purpose |
+| --- | --- |
+| `storage` | Trusted local/session authentication state and extension storage access |
+| `www.epicgames.com` | Expected OAuth redirect page |
+| Epic account public service | OAuth token exchange and refresh |
+| `www.fab.com` | Authenticated Library and artifact Manifest metadata |
+| Fastly, Akamai, and Epic CloudFront CDN hosts | Direct signed Manifest and chunk download |
+| User-selected directory handle | Create one non-overwriting TAR output |
 
-## Download Pipeline
+Host permissions are a maximum capability, not sufficient authorization for a request. Descriptor-origin checks and validation of the locally derived chunk path remain mandatory.
 
-1. **Library page** sends `manifest:fetch` → SW POSTs Fab API → CDN match by host → returns `{ manifestUrls, baseUrls, baseUrlTokens, manifestBase64 }`
-2. **Library page** decodes base64 → parses manifest (auto-detects binary vs JSON format)
-3. **ChunkCache** queues chunk URLs → batches 8 at a time → `proxy:batch` to SW → SW fetches CDN in parallel → returns base64 array → page decodes and decompresses
-4. **buildTar()** streams each file into a USTAR archive via `FileSystemWritableFileStream`
-5. Single `.tar` output — bypasses Chrome's `.dll`/`.exe` FSAA blocking
+## 11. Manual release contract
 
-## CORS Bypass Strategy
+The supported distribution is a manually reviewed ZIP loaded through Chrome Developer mode. A release contains runtime extension files, documentation, and the repository `LICENSE`; it excludes repository metadata, logs, tests, downloads, profiles, tokens, authorization codes, and complete signed URLs.
 
-The library page (`chrome-extension://` origin) cannot `fetch()` CDN resources directly (CORS blocks). The service worker has no CORS restrictions. Therefore:
+Release acceptance requires:
 
-- **Manifest file**: SW fetches from CDN, returns as base64
-- **Chunks**: SW exposes `proxy:batch` handler — library page sends up to 8 chunk URLs per message, SW fetches all in parallel and returns base64-encoded results
+- JavaScript syntax checks;
+- local synthetic validation of authentication races, pagination, parser bounds, integrity failure, TAR/PAX paths, scheduler limits, cancellation, and collision-resistant output behavior;
+- Chrome smoke tests for login/restart/logout, account cache isolation, stale refresh fallback, directory-picker cancellation, one JSON Manifest asset, one binary Manifest asset, and a large download;
+- a live, redacted compatibility check for OAuth state/PKCE switches, CDN signed-query and redirect behavior, current Manifest/chunk versions, and the Fab `manifestHash` field.
 
-## TAR Format
-
-USTAR format, 512-byte headers. Fields:
-
-| Offset | Size | Field |
-|---|---|---|
-| 0 | 100 | Filename |
-| 100 | 8 | Mode (octal, `000644`) |
-| 124 | 12 | Size (octal) |
-| 136 | 12 | Mtime (octal, Unix timestamp) |
-| 148 | 8 | Checksum (byte sum of header with spaces in checksum field) |
-| 156 | 1 | Type flag (`0` = regular file) |
-| 345 | 155 | USTAR prefix (directory part) |
-
-Each file entry: header → file data → padding to 512 bytes. Archive ends with two zero blocks.
-
-## Permissions
-
-| Permission | Reason |
-|---|---|
-| `storage` | Token + library cache persistence |
-| Host: `*.epicgames.com` | OAuth redirect detection |
-| Host: `*.fab.com` | Library + manifest API |
-| Host: `*.fastly-edge.com` / `*.akamaized.net` / `*.epicgamescdn.com` | CDN chunk downloads |
+No commit, tag, ZIP creation, or manual test result implies permission to push. The reviewed commit range is pushed only after explicit user approval of that exact revision.
