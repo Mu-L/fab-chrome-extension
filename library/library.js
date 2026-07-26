@@ -265,7 +265,6 @@ function createCard(item) {
   const imageUrl = safeImageUrl(item.images?.[0]?.url);
   if (imageUrl) {
     const image = createElement("img", { className: "card-thumb" });
-    image.crossOrigin = "anonymous";
     image.src = imageUrl;
     image.alt = "";
     image.loading = "lazy";
