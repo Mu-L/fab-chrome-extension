@@ -15,6 +15,19 @@ const MAX_LOOKAHEAD_INSPECTED_PARTS = 128;
 const MAX_DECODED_CHUNK_BYTES = 128 * MiB;
 const MAX_MANIFEST_RESPONSE_BYTES = 64 * MiB;
 const MAX_CHUNK_RESPONSE_BYTES = 128 * MiB + 64 * 1024;
+const CHUNK_HEADER_MARGIN_BYTES = 64 * 1024;
+
+// The manifest's per-chunk fileSize is not a reliable upper bound for the
+// bytes a CDN actually serves: chunks may be stored uncompressed (header +
+// full window) even when the manifest records a smaller compressed size.
+// Epic's own clients (and legendary) do not cap the fetch at fileSize; the
+// chunk header + hash validation in decodeChunkPayload is what guarantees
+// integrity. Keep a memory bound, but derive it from the decoded window size.
+function chunkFetchLimit(chunk) {
+  const windowBound = (chunk.windowSize || MAX_DECODED_CHUNK_BYTES) + CHUNK_HEADER_MARGIN_BYTES;
+  const limit = Math.max(chunk.fileSize || 0, windowBound);
+  return Math.min(limit, MAX_CHUNK_RESPONSE_BYTES);
+}
 const LARGE_DOWNLOAD_CONFIRM_BYTES = 32 * GiB;
 const MAX_TOTAL_PAYLOAD_BYTES = 512 * GiB;
 const MAX_TOTAL_ARCHIVE_BYTES = 520 * GiB;
@@ -294,7 +307,7 @@ class BoundedChunkStore {
       `Chunk ${guid} decoded size`,
     );
     const responseBytes = assertSafeInteger(
-      chunk.fileSize,
+      chunkFetchLimit(chunk),
       1,
       MAX_CHUNK_RESPONSE_BYTES,
       `Chunk ${guid} response size`,
@@ -475,7 +488,7 @@ class BoundedChunkStore {
         validateDownloadUrl(builtUrl, this.allowedOrigins, `Chunk ${chunk.guid}`);
         const raw = await fetchBytesLimited(builtUrl, {
           allowedOrigins: this.allowedOrigins,
-          maxBytes: chunk.fileSize,
+          maxBytes: chunkFetchLimit(chunk),
           timeoutMs: CHUNK_TIMEOUT_MS,
           signal: this.controller.signal,
           label: `Chunk ${chunk.guid} from CDN ${index + 1}`,
