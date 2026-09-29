@@ -1,5 +1,7 @@
 # Fab Content Downloader
 
+**中文** | [English](README.en.md)
+
 > ⚠️ AI Slope
 >
 > 这是个纯 Vibe、低维护的 throw-away 项目。它不是 Epic Games 或 Fab 的官方产品，不会上架 Chrome Web Store，也不保证持续更新、兼容性或技术支持。
